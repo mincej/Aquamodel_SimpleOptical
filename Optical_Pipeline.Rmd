@@ -1,0 +1,339 @@
+---
+title: "Optical_Model_Pipeline"
+author: "Simon Topp"
+date: "7/13/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(feather)
+library(gridExtra)
+library(CAST)
+library(parallel)
+library(caret)
+library(future)
+library(doParallel)
+library(Metrics)
+library(kableExtra)
+library(viridis)
+library(Hmisc)
+library(ggpmisc)
+library(lubridate)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Munge the train/test data and bring in a couple functions
+```{r cars}
+## Dominant wavelength function
+fui.hue <- function(R, G, B) {
+  
+  # Convert R,G, and B spectral reflectance to dominant wavelength based
+  # on CIE chromaticity color space
+  
+  # see Wang et al 2015. MODIS-Based Radiometric Color Extraction and
+  # Classification of Inland Water With the Forel-Ule
+  # Scale: A Case Study of Lake Taihu
+  
+  require(colorscience)
+  # chromaticity.diagram.color.fill()
+  Xi <- 2.7689*R + 1.7517*G + 1.1302*B
+  Yi <- 1.0000*R + 4.5907*G + 0.0601*B
+  Zi <- 0.0565*G + 5.5943*B
+  
+  # calculate coordinates on chromaticity diagram
+  x <-  Xi / (Xi + Yi +  Zi)
+  y <-  Yi / (Xi + Yi +  Zi)
+  z <-  Zi / (Xi + Yi +  Zi)
+  
+  # calculate hue angle
+  alpha <- atan2( (x - 0.33), (y - 0.33)) * 180/pi
+  
+  # make look up table for hue angle to wavelength conversion
+  cie <- cccie31 %>%
+    mutate(a = atan2( (x - 0.33), (y - 0.33)) * 180/pi) %>%
+    dplyr::filter(wlnm <= 700) %>%
+    dplyr::filter(wlnm >=380)
+  
+  # find nearest dominant wavelength to hue angle
+  wl <- cie[as.vector(sapply(alpha,function(x) which.min(abs(x - cie$a)))), 'wlnm']
+  
+  #out <- cbind(as.data.frame(alpha), as.data.frame(wl))
+  
+  return(wl)
+}
+
+## Polynomial reflectance corrections
+load('models/landsat_poly_corrs.Rdata')
+
+
+## Bring in the initial munged dataset
+srMunged <- read_feather('data/in/srMunged.feather') %>%
+  filter(parameter == 'secchi',
+         value <= 10,  ## Max depth used in NLA
+         !is.na(CatAreaSqKm)) %>% #100 obs that didn't match up with LakeCat
+  mutate(COMID = as.character(COMID),
+         areasqkm = signif(areasqkm, 2), ## Anonymize variables
+         meandused = signif(meandused, 2), ## Anonymize variables
+         sat = factor(sat, levels = c(5,7,8), labels = c('l5', 'l7', 'l8'))) 
+
+
+## Standardize the reflectance values between sensors
+refCorrect <- srMunged %>% select(UniqueID, blue, green, red, nir, sat) %>%
+  gather(blue:nir, key = 'band' , value = 'value') %>%
+  spread(sat, value) %>%
+  group_by(band) %>%
+  nest() %>%
+  left_join(funcs.8) %>% #From 1_nhd_join_and_munge line 362
+  left_join(funcs.5) %>%
+  mutate(pred8 = map2(lm8, data, predict),
+         pred5 = map2(lm5, data, predict)) %>%
+  select(-c(lm8,lm5)) %>%
+  unnest(c(data, pred8, pred5)) %>%
+  select(-c(l8,l5)) %>%
+  rename(l8 = pred8, l5 = pred5) %>% gather(l5,l7,l8, key = 'sat', value = 'value') %>%
+  spread(band, value) %>%
+  na.omit() 
+
+srMunged <- srMunged %>% 
+  select(-c(blue, green, red, nir, sat)) %>% left_join(refCorrect) %>%
+  mutate(NR = nir/red,
+         BG = blue/green,
+         dWL = fui.hue(red, green, blue))
+```
+
+## Train the model
+
+```{r pressure, echo=FALSE}
+## Choose whatever optical inputs you want
+## As a  side note NR, BG, and dWL are least sensitive to changes in atmoshperic optical depth
+features <- "blue, green, red, nir, NR, BG, dWL"
+features <- str_split(features, pattern = ', ') %>% unlist()
+
+##Pull 20% as holdout data, make sure it's regionally representative
+set.seed(340987)
+holdOut <- srMunged %>%
+  group_by(region) %>%
+  sample_frac(.2)
+
+## Remove holdout data and add time groups to create folds
+df <- srMunged %>% filter(!UniqueID %in% holdOut$UniqueID) %>%
+  mutate(julian = as.numeric(julian.Date(date)),
+  timeCluster = cut_number(julian, 5))
+
+#Create some spatially/temporally explicit folds for cv training to prevent overfitting
+folds <- CreateSpacetimeFolds(df, spacevar = 'COMID', timevar = 'timeCluster', k= 5, seed = 34985)
+
+## Make sure holdout is repreentative of secchi values in general
+grid.arrange(ggplot(df, aes(x = value)) + geom_histogram(),
+             ggplot(holdOut, aes(x = value)) + geom_histogram())
+
+## train the model
+
+## Set up grid of hyperparameters, this is for gbLinear, gbTree has different hyperparameters.
+## I found that gbLinear does a slightly better job at lower values, but you can play with both
+## Also, heads up, if you make this grid too big the hypertuning can take a very long time,
+## If you switch to gbTree then you should remove the z-score normalization for pre-processing.
+grid_train <- expand.grid(
+  nrounds = seq(100,300,100),
+  alpha = c(0.05,.1,.5,1),
+  lambda = c(0.05,.1,.5,1),
+  eta = c(0.05,.1, 0.3)
+)
+
+#Set up a cluster to run everything in parrallel
+cl <- makeClusterPSOCK(availableCores()-1)
+registerDoParallel(cl)
+
+# Set up controls for model training
+train_control <- caret::trainControl(method="cv", savePredictions = F, 
+                          returnResamp = 'final', index = folds$index, 
+                          indexOut = folds$indexOut, verboseIter = T)
+
+# Do space-time cv across the tuning grid to find the best model
+model_train <- caret::train(
+  x = df %>% select(all_of(features)),
+  y = df$value,
+  trControl = train_control,
+  tuneGrid = grid_train,
+  method = "xgbLinear",
+  preProcess = c('center', 'scale'),
+  importance = F,
+  verbose = TRUE
+)
+
+stopCluster(cl)
+
+model_train$bestTune
+## Results for above grid
+    # nrounds lambda alpha  eta
+    #  100      1   0.5   0.05
+
+## Build the final model based on the hypertuning above
+grid_final <- expand.grid(
+  nrounds = model_train$bestTune$nrounds,
+  alpha = model_train$bestTune$alpha,
+  lambda = model_train$bestTune$lambda,
+  eta = model_train$bestTune$eta)
+  
+
+model_final <- caret::train(
+  x = df %>% select(all_of(features)),
+  y = df$value,
+  trControl = train_control,
+  tuneGrid = grid_final,
+  method = "xgbLinear",
+  preProcess = c('center', 'scale'),
+  importance = T,
+  verbose = TRUE
+)
+
+## Test on hold-out data
+save(model_final, file = 'models/gbLinear_OpticalModel.Rdata')
+```
+
+## Look at some validation
+
+```{r}
+model <- load('models/gbLinear_OpticalModel.Rdata')
+
+output <- tibble(Actual = holdOut$value, Predicted = predict(model_final, holdOut[,features]), UniqueID = holdOut$UniqueID)
+
+evals <- output %>%
+  summarise(rmse = rmse(Actual, Predicted),
+            mae = mae(Actual, Predicted),
+            mape = mape(Actual, Predicted),
+            bias = bias(Actual, Predicted),
+            p.bias = percent_bias(Actual, Predicted),
+            smape = smape(Actual, Predicted))
+
+evals %>% kable(digits = 5) %>% kable_styling() %>% scroll_box(width = '4in')
+
+## These should be roughly the same, if the holdout RMSE is way lower the
+## model is potentially overfit
+print(paste0('CV RMSE: ', model_final$results$RMSE, '.  Holdout RMSE: ', evals$rmse))
+
+## Overall validation
+ggplot(output, aes(x = Actual, y = Predicted)) + 
+  geom_hex(aes(fill = ..count..)) + 
+  scale_fill_viridis(name = 'Point\nCount', trans = 'log10') + 
+  geom_abline(color = 'red') + 
+  stat_poly_eq(aes(label =  paste(stat(adj.rr.label))),
+               formula = y~x, parse = TRUE, 
+               label.y = Inf, vjust = 1.3) +
+  #scale_x_continuous(trans = 'log10', labels = scales::comma) +
+  #scale_y_continuous(trans = 'log10', labels = scales::comma) +
+  #coord_equal(ratio = 1) +
+  labs(title = 'Hold-Out Validation', subtitle = 'Red line is 1:1', x = 'Actual', y = 'Predicted')
+
+
+## Take a look across lake size, sensor, and time
+
+output.full <- output %>%
+  left_join(srMunged, by = 'UniqueID')
+
+## Secondary Validation figure
+## Look at validation by lake size
+output.full %>% mutate(Size.Group = cut(areasqkm, breaks = c(-1,.1,1,10,100,100000), labels = c('<.1','.1-1','1-10', '10-100', '>100'))) %>% ggplot(aes(x = Actual, y = Predicted)) + 
+  geom_hex(aes(fill = ..count..)) + 
+  scale_fill_viridis(name = 'Point\nCount', trans = 'log10') + 
+  geom_abline(color = 'red') + 
+  stat_poly_eq(aes(label =  paste(stat(adj.rr.label))),
+               formula = y~x, parse = TRUE, 
+               label.y = Inf, vjust = 1.1, size = 3) +
+  theme_bw() +
+  labs(title = 'Hold-Out Validation by Lake Size (sq. km)', x = 'Actual', y = 'Predicted') + facet_wrap(~Size.Group)
+
+## Validation by satellite
+output.full %>% 
+  mutate(sat = factor(sat, levels = c('l5', 'l7','l8'), labels = c('Landsat 5', 'Landsat 7', 'Landsat 8'))) %>%
+  ggplot(aes(x = Actual, y = Predicted)) + 
+  geom_hex(aes(fill = ..count..)) + 
+  scale_fill_viridis(name = 'Point\nCount', trans = 'log10') + 
+  geom_abline(color = 'red') + 
+  stat_poly_eq(aes(label =  paste(stat(adj.rr.label))),
+               formula = y~x, parse = TRUE, 
+               label.y = Inf, vjust = 1.1, size = 3) +
+  labs(title = 'Hold-Out Validation by Sensor', x = 'Actual', y = 'Predicted') +
+  theme_bw() +
+  facet_wrap(~sat, nrow = 1)
+
+## By year
+output.full %>% group_by(year) %>% 
+  summarise(bias = bias(Actual, Predicted)) %>%
+  ggplot(aes(x = year, y = bias)) + 
+  geom_point() + geom_line() + 
+  geom_smooth(method = 'lm') +
+  theme_bw() + 
+  labs(title = 'Hold-Out Bias by Year', x = 'Year', y = 'Bias (Actual-Predicted)') +
+  ggpubr::stat_regline_equation(label.x.npc = 'middle', label.y.npc  = 'top')
+
+
+# Take a look at feature importance
+model_final$modelInfo$varImp(model$finalModel) %>%
+  mutate(Feature = fct_reorder(rownames(.), Overall, .desc = T)) %>%
+  arrange(Overall) %>%
+  ggplot(., aes(x = Feature, y = Overall)) + 
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(title = 'Feature Importance', y = 'Importance (Model Gain)') 
+```
+
+## Example prediction code
+
+```{r}
+## Munge your pulled reflectance values and standardize them
+#####  Note, for this to work you need all 3 sensor represented in the csv
+##### you're only predicting on Landsat 8 say, you'll need to alter this function
+testFile <- 'data/in/TestPredictionFile.cvs'
+
+predMunger <- function(file){
+  df <- read.csv(file, stringsAsFactors = F) %>%
+        mutate(COMID = as.character(COMID),
+               date = ymd_hms(date),
+               year = year(date),
+               UniqueID = row_number(),
+               sat = factor(sat, levels = c(5,7,8), labels = c('l5','l7','l8'))) %>%
+        filter(!is.na(blue),
+               dswe == 1, ## These QA filters are unique to the pulls I do
+               dswe_sd < .4, ## if you don't have them you can add whatever
+               cScore == 0, ## QA filters you want to apply
+               pixelCount > 5) %>%
+        gather(blue, green, red, nir, key = 'band' , value = 'value') %>%
+        spread(sat, value) %>%
+        group_by(band) %>%
+        nest() %>%
+        left_join(funcs.8) %>% 
+        left_join(funcs.5) %>%
+        mutate(pred8 = map2(lm8, data, predict),
+               pred5 = map2(lm5, data, predict)) %>%
+        select(-c(lm8,lm5)) %>%
+        unnest(c(data, pred8, pred5)) %>%
+        select(-c(l8,l5)) %>%
+        rename(l8 = pred8, l5 = pred5) %>% gather(l5,l7,l8, key = 'sat', value = 'value') %>%
+        spread(band, value) %>%
+        filter(!is.na(blue)) %>%
+        mutate(NR = nir/red,
+               BG = blue/green,
+               dWL = fui.hue(red, green, blue)) %>%
+        filter_at(vars(blue,green,red,nir,swir1,swir2),all_vars(.>0 & .< 2000))
+  return(df)
+  }
+
+## Run your file through the munger
+testMunged <- predMunger(testFile)
+
+## Predict clarity based on the optical model
+testMunged$Predicted <- predict(model_final, testMunged[,features])
+
+## Take a look at the distribution of predictions
+hist(testMunged$Predicted)
+ggplot(testMunged, aes(x = date, y = Predicted)) + geom_line()
+
+```
+
+
